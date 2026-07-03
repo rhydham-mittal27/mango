@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import importlib.util
 import re
 import shutil
 import subprocess
@@ -412,8 +413,11 @@ def doctor_command(directory: str | None = None) -> list[dict]:
     """Sanity-check an existing project for drift a hand-edit can
     introduce that `new-module`/`remove_module`'s auto-wiring doesn't
     protect against: a module folder created or deleted by hand without
-    updating registry.py, a missing `.env`, or a `pyproject.toml` that
-    lost its `mangoframe` dependency. Each entry: `{"name", "ok", "detail"}`.
+    updating registry.py, a missing `.env`, a `pyproject.toml` that lost
+    its `mangoframe` dependency, or a second mango project's `app`
+    package (every mango project uses that same top-level name)
+    silently shadowing this one from a different environment. Each
+    entry: `{"name", "ok", "detail"}`.
     """
     root = _resolve_project_root(directory)
     manifest = _load_manifest(root / MANIFEST_FILENAME)
@@ -469,7 +473,44 @@ def doctor_command(directory: str | None = None) -> list[dict]:
             "detail": "ok" if has_dependency else "no 'mangoframe' entry in [project.dependencies]",
         })
 
+    checks.append(_check_app_package_collision(root))
+
     return checks
+
+
+def _check_app_package_collision(root: Path) -> dict:
+    """Every mango project's top-level package is named `app` (see
+    mango/project.py's scaffold) — installing a SECOND mango project
+    editable into the same environment silently shadows the first one:
+    `import app` resolves to whichever one Python's import system finds,
+    with no error, and every other mango command (`modules`/`routes`)
+    then quietly runs the wrong project's code. `find_spec` locates
+    "app" without executing it (safe — no import side effects), so this
+    can run unconditionally as part of `doctor`.
+    """
+    expected_dir = (root / "app").resolve()
+    spec = importlib.util.find_spec("app")
+    if spec is None or not spec.origin:
+        return {
+            "name": "no colliding 'app' package from another project",
+            "ok": True,
+            "detail": "no 'app' package currently importable (nothing to collide with yet)",
+        }
+
+    origin_dir = Path(spec.origin).resolve().parent
+    if origin_dir == expected_dir:
+        return {"name": "no colliding 'app' package from another project", "ok": True, "detail": "ok"}
+
+    return {
+        "name": "no colliding 'app' package from another project",
+        "ok": False,
+        "detail": (
+            f"an 'app' package is already importable from {origin_dir}, not this project's "
+            f"{expected_dir} — likely another mango project installed editable (pip install -e .) "
+            "into this same environment. mango commands may silently run the WRONG project's code. "
+            "Give each mango project its own virtualenv."
+        ),
+    }
 
 
 def migrate_command(message: str = "auto", directory: str | None = None) -> None:
