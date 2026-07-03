@@ -43,6 +43,8 @@ import sys
 
 from mango.cli import main
 
+_ORIGINAL_SYS_PATH = list(sys.path)  # snapshot before any test mutates it, for _reset_app_imports() to restore
+
 
 def _run(monkeypatch, argv: list[str]):
     """Call main() with argv, capturing SystemExit's code (None if it didn't exit)."""
@@ -55,12 +57,21 @@ def _run(monkeypatch, argv: list[str]):
 
 
 def _reset_app_imports():
-    """Drop cached `app`/`app.*` modules — see module docstring for why
-    this is needed between tests that import different projects' `app`
-    packages, all literally named `app`."""
+    """Drop cached `app`/`app.*` modules AND restore `sys.path` to its
+    pre-test snapshot — see module docstring for why this is needed
+    between tests that import different projects' `app` packages, all
+    literally named `app`. Restoring `sys.path` matters too:
+    `mango.cli._import_dotted` permanently inserts each project's root
+    (`sys.path.insert(0, ...)`, never removed) — across many tests in
+    one process those insertions accumulate, so a later test's
+    `importlib.util.find_spec("app")` (doctor's app-package-collision
+    check) can resolve to an EARLIER test's now-stale project root
+    purely from sys.path leftovers, not an actual real-world collision.
+    """
     for mod_name in list(sys.modules):
         if mod_name == "app" or mod_name.startswith("app."):
             del sys.modules[mod_name]
+    sys.path[:] = _ORIGINAL_SYS_PATH
 
 
 def test_version_flag(monkeypatch, capsys):
@@ -259,6 +270,7 @@ def test_doctor_reports_orphan_module_and_missing_env(monkeypatch, tmp_path, cap
     (orphan_dir / "module.py").write_text("# stub, never wired into registry.py\n", encoding="utf-8")
 
     monkeypatch.chdir(project_root)
+    _reset_app_imports()  # a prior test's tmp_path project may still be cached as "app" in sys.modules
     code = _run(monkeypatch, ["doctor"])
     assert code == 1
     out = capsys.readouterr().out
@@ -276,9 +288,39 @@ def test_doctor_all_checks_pass_for_healthy_project(monkeypatch, tmp_path, capsy
     _run(monkeypatch, ["new-module", "clitest_healthy"])
     (project_root / ".env").write_text("DATABASE_URL=sqlite+aiosqlite:///./demo.db\n", encoding="utf-8")
 
+    _reset_app_imports()  # a prior test's tmp_path project may still be cached as "app" in sys.modules
     code = _run(monkeypatch, ["doctor"])
     assert code is None
     assert "all checks passed" in capsys.readouterr().out
+
+
+def test_doctor_detects_colliding_app_package_from_another_project(monkeypatch, tmp_path, capsys):
+    """mango doctor flags it when a DIFFERENT project's `app` package is
+    already importable (e.g. left over from a previous `import app` in
+    this same process/environment) instead of this project's own — the
+    silent-wrong-project-runs bug two mango projects sharing one
+    environment can hit, since every mango project's package is named
+    `app`."""
+    other_root = tmp_path / "other_project"
+    _run(monkeypatch, ["init", ".", str(other_root)])  # scaffolds other_root/app/...
+
+    _reset_app_imports()
+    monkeypatch.chdir(other_root)
+    monkeypatch.syspath_prepend(str(other_root))
+    import app  # noqa: F401  (imports other_root's app package into sys.modules, simulating the collision)
+
+    healthy_root = tmp_path / "healthy_project"
+    _run(monkeypatch, ["init", ".", str(healthy_root)])
+    monkeypatch.chdir(healthy_root)
+    # deliberately NOT calling _reset_app_imports() here — the whole point
+    # is that other_root's "app" is still cached, simulating the collision
+
+    code = _run(monkeypatch, ["doctor"])
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "FAIL" in out
+    assert "app" in out.lower()
+    assert "another mango project" in out or str(other_root.resolve()) in out
 
 
 def test_migrate_requires_alembic_ini(monkeypatch, tmp_path):

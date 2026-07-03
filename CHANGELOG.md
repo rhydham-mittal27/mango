@@ -8,6 +8,18 @@ always be listed under "Changed"/"Removed" below, never silent.
 
 ## [Unreleased]
 
+## [0.8.0]
+
+### Added
+- `mango doctor` now detects when a DIFFERENT mango project's `app`
+  package is already importable instead of this project's own — every
+  mango project's top-level package is named `app` (see
+  `mango init`'s scaffold), so two projects `pip install -e .`'d
+  editable into the same environment silently collide: `import app`
+  resolves to whichever one Python's import system finds, with no
+  error, and other mango commands (`modules`/`routes`) then quietly run
+  the WRONG project's code. Fixes #3.
+
 ## [0.7.0]
 
 ### Fixed
