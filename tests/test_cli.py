@@ -169,6 +169,22 @@ def test_init_migrations_auto_detects_base_import(monkeypatch, tmp_path):
     assert (project_root / "migrations" / "env.py").exists()
 
 
+def test_init_migrations_auto_wires_models_import_from_manifest(monkeypatch, tmp_path):
+    """mango init-migrations, run inside a project, also imports the
+    project's registry.py in env.py — without this, every model module
+    stays unimported and `alembic revision --autogenerate` silently
+    diffs against an empty Base.metadata, producing an empty migration."""
+    _run(monkeypatch, ["init", "demo_shop", str(tmp_path)])
+    project_root = tmp_path / "demo_shop"
+
+    monkeypatch.chdir(project_root)
+    code = _run(monkeypatch, ["init-migrations"])
+    assert code is None
+
+    env_contents = (project_root / "migrations" / "env.py").read_text(encoding="utf-8")
+    assert "import app.registry" in env_contents
+
+
 def test_remove_module_deletes_and_unwires(monkeypatch, tmp_path, capsys):
     """mango remove-module <name> deletes the module's directory and
     removes its import from registry.py — the inverse of new-module."""
