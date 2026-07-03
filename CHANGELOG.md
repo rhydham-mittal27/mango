@@ -8,6 +8,21 @@ always be listed under "Changed"/"Removed" below, never silent.
 
 ## [Unreleased]
 
+## [0.9.0]
+
+### Added
+- `MangoRepository.get()`/`.exists()`/`.get_or_404()` now support
+  composite primary keys — pass `id_` as a tuple in
+  `model.__mapper__.primary_key` order (the same shape SQLAlchemy's own
+  `Session.get()` already expects), instead of only a single-column
+  scalar. A pure join-table model (e.g. a many-to-many association row)
+  is the common case: a composite `(a_id, b_id)` primary key needs no
+  surrogate id column, and previously `exists()`/`get(options=...)`
+  raised `ValueError` unconditionally for any composite-PK model.
+  `get()` without `options=` already worked via `Session.get()`'s own
+  tuple-identity support; the fix is in the `options=`/`exists()` path,
+  which built its own WHERE clause assuming a single column. Fixes #4.
+
 ## [0.8.0]
 
 ### Added
