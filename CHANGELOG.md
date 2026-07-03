@@ -8,6 +8,82 @@ always be listed under "Changed"/"Removed" below, never silent.
 
 ## [Unreleased]
 
+## [0.5.0]
+
+### Added
+- `mango modules` — lists every registered module in dependency-
+  respecting mount order (name, prefix, `depends_on`), by importing the
+  project's `registry.py` and reusing `App`'s own topological sort.
+- `mango routes` — lists every currently-mounted HTTP route (method,
+  path, name), by importing the project's `app_import` (`app.main:app`
+  by default, per `project.mango`) — no need to boot the server and
+  click through `/docs`. `mango.App` gained a public `.routes()` method
+  for this.
+- `mango remove-module <name>` — the inverse of `new-module`: deletes
+  the module's directory and un-wires its import from `registry.py`
+  (auto-detected via `project.mango`, same as `new-module`).
+- `mango doctor` — sanity-checks an existing project for drift that
+  hand-editing can introduce: a module folder created without updating
+  `registry.py` (orphan), a `registry.py` import pointing at a deleted
+  module folder (stale), a missing `.env`, or a `pyproject.toml` that
+  lost its `mangoframe` dependency. Exits 1 if any check fails.
+- `mango migrate "<message>"` — wraps the two-command Alembic loop
+  (`revision --autogenerate -m "<message>"` + `upgrade head`) every
+  model change requires, via `python -m alembic` so it always resolves
+  to the current virtualenv's Alembic. Requires `mango init-migrations`
+  to have run already.
+- `project.mango`'s manifest gained an `app_import` field (default
+  `"app.main:app"`), used by `mango routes`.
+
+## [0.4.0]
+
+### Added
+- `mango init .` — scaffolds the given directory (default: current
+  directory) in place instead of creating a new `directory/name/`
+  subdirectory, inferring the project's name from the directory's own
+  name. Covers the common case of an already-created, already-`cd`'d-
+  into (perhaps already-`git init`'d) empty folder that should become
+  the project root directly. Re-running it against a directory that
+  already has scaffolded files raises, naming every conflicting file,
+  rather than silently overwriting anything.
+
+## [0.3.0]
+
+### Added
+- `project.mango` — a small TOML manifest `mango init` now writes at the
+  project root (name/modules_dir/registry/base_import), the way
+  `tsconfig.json` marks a TypeScript project. `mango new-module`/
+  `init-migrations` walk upward from the current directory to find it:
+  `new-module <name>` (no directory) creates the module under the
+  manifest's `modules_dir` and auto-appends its import to `registry.py`;
+  `init-migrations` (no args) reads `base_import` and the project root
+  from it. Passing an explicit directory/base_import still overrides the
+  manifest entirely, so nothing changes for a project scaffolded before
+  this existed.
+
+## [0.2.0]
+
+### Added
+- `mango` (no subcommand) now prints a quickstart with concrete next
+  commands instead of dumping argparse help and exiting 1 — the bare
+  command is a first-time-user entry point, not a usage error.
+- Every `mango init` / `new-module` / `init-migrations` run now prints
+  the concrete next step (cd/install/env/run, the registry import line
+  to add, the alembic commands to run) instead of a bare `created X`.
+- `mango init` / `mango new-module` validate the given name up front
+  (lowercase snake_case) with an actionable error and suggested fix,
+  instead of failing deep inside file scaffolding or module import.
+- Every CLI subcommand's `--help` now includes copy-pasteable examples.
+
+### Fixed
+- Projects scaffolded by `mango init` depended on `mango-api` in the
+  generated `pyproject.toml`, a name that doesn't exist on PyPI (the
+  real distribution is `mangoframe`, per the [0.1.1] rename below) —
+  every project scaffolded before this fix has a broken dependency list
+  and needs `mango-api` replaced with `mangoframe` by hand.
+
+## [0.1.1]
+
 ### Changed
 - Distribution name on PyPI changed from `mango-api` to `mangoframe` —
   `mango-api` was rejected by PyPI as "too similar to an existing

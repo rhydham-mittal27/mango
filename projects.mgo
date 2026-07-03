@@ -1,0 +1,29 @@
+# projects.mgo — same router as the FastAPI original, in an invented
+# compact resource DSL. Indentation is the only nesting rule (like
+# Python). Everything below is EQUIVALENT to the ~230-line file you
+# pasted — nothing is left out, just said once instead of five times.
+
+resource Project at "/projects":
+    auth:    bearer -> User.id via decode_token          # replaces oauth2_scheme + get_current_user, once for the whole resource
+    model:   Project
+    schemas: create=ProjectCreate, update=ProjectUpdate, out=ProjectResponse
+
+    create(data) as any:
+        new project(data, owner_id=me.id)
+        new member(project, me, role="owner")
+        -> 201 project
+
+    list(page=1, limit<=100, search?) as member:
+        from Project join ProjectMember on me
+        where search? -> name|description ~ search
+        sort -created_at
+        -> page(PaginatedProjects)
+
+    update(id, data) as owner|admin:
+        project = id! touch(updated_at)
+        project <- data
+        -> project
+
+    delete(id) as owner:
+        id! -> del
+        -> {message: "Project deleted successfully"}

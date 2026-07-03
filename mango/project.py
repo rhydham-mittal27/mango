@@ -8,15 +8,39 @@ project-root files (`pyproject.toml`, `.env.example`, `.gitignore`,
 those modules live in. See docs/PROJECT_STRUCTURE.md for the full
 convention and rationale.
 
+Also writes `project.mango` at the project root — a small TOML manifest
+(see `_PROJECT_MANGO` below) that marks a directory as a mango project
+and records where its modules/registry live, the way `tsconfig.json`
+marks a TypeScript project. `mango new-module`/`init-migrations`
+(mango/cli.py) look for it so they can default their own arguments
+instead of asking the user to repeat `app/modules` on every invocation.
+
 Classes: none.
 
 Functions (1):
-    - init_project: writes a complete starter project into a new
-      directory named after the project.
+    - init_project: writes a complete starter project, either into a new
+      `directory/name/` subdirectory, or in place into `directory` itself
+      when `name` is `"."` (e.g. an already-`cd`'d-into, already-`git
+      init`'d empty folder that should become the project root, not gain
+      a redundant nested copy of itself).
 """
 from __future__ import annotations
 
 from pathlib import Path
+
+MANIFEST_FILENAME = "project.mango"  # marks a directory as a mango project root
+
+_PROJECT_MANGO = """\
+# project.mango — marks this directory as a mango project root; read by
+# the `mango` CLI (new-module/init-migrations/routes/modules/doctor/
+# migrate) to default its own arguments instead of asking you to repeat
+# them on every invocation.
+name = "{slug}"
+modules_dir = "app/modules"
+registry = "app/registry.py"
+base_import = "app.db:Base"
+app_import = "app.main:app"
+"""
 
 _PYPROJECT = """\
 [project]
@@ -25,7 +49,7 @@ version = "0.1.0"
 description = "A mango project."
 requires-python = ">=3.11"
 dependencies = [
-    "mango-api",
+    "mangoframe",
     "asyncpg",
     "aiosqlite",
 ]
@@ -77,15 +101,17 @@ python -m app.main
 ## Add a module
 
 ```bash
-mango new-module <name> app/modules
+mango new-module <name>
 ```
 
-Then add a line for it to `app/registry.py` so it actually gets mounted.
+Run from anywhere inside this project — `project.mango` tells `mango`
+where `modules_dir`/`registry.py` are, so the module is created under
+`app/modules/` and wired into `app/registry.py` automatically.
 
 ## Migrations
 
 ```bash
-mango init-migrations app.db:Base
+mango init-migrations
 alembic revision --autogenerate -m "..."
 alembic upgrade head
 ```
@@ -172,33 +198,64 @@ _TESTS_INIT = ""  # tests/__init__.py — empty
 
 
 def init_project(name: str, directory: str = ".") -> Path:
-    """Scaffold a new mango project named `name` into `directory/name/`.
+    """Scaffold a new mango project.
+
+    Normally scaffolds into a new `directory/name/` subdirectory. Pass
+    `name="."` to instead scaffold in place into `directory` itself (the
+    project's name is then taken from that directory's own name) — for
+    the common case of an already-created, already-`cd`'d-into empty
+    folder (e.g. one `git init` already ran in) that should become the
+    project root directly, not gain a redundant nested copy of itself.
 
     Writes: pyproject.toml, .env.example, .gitignore, README.md,
     app/__init__.py, app/main.py, app/registry.py, app/db.py,
-    app/modules/__init__.py, tests/__init__.py.
+    app/modules/__init__.py, tests/__init__.py, project.mango.
 
     Raises:
-        FileExistsError: if `directory/name/` already exists.
+        FileExistsError: if `directory/name/` already exists (normal
+            mode), or if any file this would write already exists in
+            `directory` (in-place mode) — named in the error, so an
+            accidental re-run against a non-empty folder doesn't
+            silently overwrite anything.
     """
-    slug = name.lower().replace(" ", "-").replace("_", "-")  # normalized project/package name for pyproject.toml
-    root = Path(directory) / name  # the new project's root directory
-    if root.exists():
-        raise FileExistsError(f"{root} already exists")
+    in_place = name == "."
+    if in_place:
+        root = Path(directory).resolve()  # the existing directory becomes the project root, unchanged
+        project_name = root.name or "project"  # derived from the folder's own name, not chosen by the caller
+        if root.exists() and not root.is_dir():
+            raise FileExistsError(f"{root} is not a directory")
+    else:
+        root = Path(directory) / name  # the new project's root directory, to be created
+        project_name = name
+        if root.exists():
+            raise FileExistsError(f"{root} already exists")
 
-    (root / "app" / "modules").mkdir(parents=True)
-    (root / "tests").mkdir(parents=True)
+    slug = project_name.lower().replace(" ", "-").replace("_", "-")  # normalized package name for pyproject.toml
 
-    (root / "pyproject.toml").write_text(_PYPROJECT.format(slug=slug), encoding="utf-8")
-    (root / ".env.example").write_text(_ENV_EXAMPLE.format(slug=slug), encoding="utf-8")
-    (root / ".gitignore").write_text(_GITIGNORE, encoding="utf-8")
-    (root / "README.md").write_text(_README.format(name=name, slug=slug), encoding="utf-8")
+    targets = {
+        root / "pyproject.toml": _PYPROJECT.format(slug=slug),
+        root / ".env.example": _ENV_EXAMPLE.format(slug=slug),
+        root / ".gitignore": _GITIGNORE,
+        root / "README.md": _README.format(name=project_name, slug=slug),
+        root / "app" / "__init__.py": _APP_INIT,
+        root / "app" / "db.py": _DB_PY,
+        root / "app" / "registry.py": _REGISTRY_PY,
+        root / "app" / "main.py": _MAIN_PY.format(name=project_name),
+        root / "app" / "modules" / "__init__.py": _MODULES_INIT,
+        root / "tests" / "__init__.py": _TESTS_INIT,
+        root / MANIFEST_FILENAME: _PROJECT_MANGO.format(slug=slug),
+    }  # every file this scaffolds, mapped to its rendered content
 
-    (root / "app" / "__init__.py").write_text(_APP_INIT, encoding="utf-8")
-    (root / "app" / "db.py").write_text(_DB_PY, encoding="utf-8")
-    (root / "app" / "registry.py").write_text(_REGISTRY_PY, encoding="utf-8")
-    (root / "app" / "main.py").write_text(_MAIN_PY.format(name=name), encoding="utf-8")
-    (root / "app" / "modules" / "__init__.py").write_text(_MODULES_INIT, encoding="utf-8")
-    (root / "tests" / "__init__.py").write_text(_TESTS_INIT, encoding="utf-8")
+    if in_place:
+        conflicts = [path for path in targets if path.exists()]  # files that would be silently overwritten
+        if conflicts:
+            listed = ", ".join(str(path.relative_to(root)) for path in conflicts)
+            raise FileExistsError(f"{root} already contains: {listed}")
+
+    (root / "app" / "modules").mkdir(parents=True, exist_ok=in_place)
+    (root / "tests").mkdir(parents=True, exist_ok=in_place)
+
+    for path, content in targets.items():
+        path.write_text(content, encoding="utf-8")
 
     return root

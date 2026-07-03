@@ -9,15 +9,51 @@ instead of the hand-rolled `sys.argv[1:]` parsing an earlier version of
 this file did (no help text, no usage on bad args, silent
 `IndexError`s on a missing argument).
 
+Beyond argparse's defaults, this file also carries the "first five
+minutes" UX: running bare `mango` prints a quickstart instead of a stub
+help message, every subcommand's `--help` includes copy-pasteable
+examples, names are validated up front with an actionable message
+instead of failing deep inside the filesystem, every successful command
+prints concrete next steps instead of a bare "created X", and most
+subcommands auto-detect the enclosing project via its `project.mango`
+manifest (see mango/project.py) instead of requiring a `directory`/
+`base_import` the user has to remember and repeat.
+
+Beyond scaffolding, this file also covers the repetitive day-to-day
+loop of working in an existing project: `routes`/`modules` introspect
+what's actually mounted (no need to boot the server and click through
+/docs), `remove-module` is `new-module`'s inverse (deletes the folder
+and un-wires the registry import), `doctor` sanity-checks a project for
+drift (orphaned/stale registry imports, missing .env, ...), and
+`migrate` wraps the two-command Alembic loop (`revision --autogenerate`
++ `upgrade head`) every model change requires.
+
 Classes: none — this file only wires up CLI commands.
 
-Functions (5):
+Functions (16):
+    - _validate_identifier: shared name validation for `init`/`new-module`.
+    - _find_manifest: walks upward from a starting directory for
+      `project.mango`.
+    - _load_manifest: parses a found `project.mango` into a dict.
+    - _resolve_project_root: resolves a project root from an explicit
+      directory or by auto-detecting `project.mango`; shared by every
+      subcommand that operates on an existing project.
+    - _import_dotted: imports a project's own dotted module path with
+      its root on sys.path, wrapping import failures in a clean ValueError.
+    - _wire_into_registry / _unwire_from_registry: append/remove a
+      module's import line in the project's registry.py.
     - new_module: writes a starter `module.py` for a new module into the
-      given directory.
+      given (or auto-detected) directory.
+    - remove_module: deletes a module's directory and un-wires its
+      registry import — the inverse of new_module.
     - init_project_command: thin CLI wrapper around
       `mango.project.init_project`.
     - init_migrations_command: thin CLI wrapper around
       `mango.migrations.init_migrations`.
+    - modules_command: lists registered modules in mount order.
+    - routes_command: lists every mounted HTTP route.
+    - doctor_command: sanity-checks an existing project for drift.
+    - migrate_command: runs `alembic revision --autogenerate` + `upgrade head`.
     - build_parser: constructs the argparse parser + all subcommands.
     - main: CLI entry point — parses argv, dispatches to the right
       command, and turns expected failures (FileExistsError, ValueError)
@@ -26,12 +62,17 @@ Functions (5):
 from __future__ import annotations
 
 import argparse
+import importlib
+import re
+import shutil
+import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 from mango import __version__
 from mango.migrations import init_migrations
-from mango.project import init_project
+from mango.project import MANIFEST_FILENAME, init_project
 
 _MODULE_TEMPLATE = '''"""{path}
 
@@ -61,32 +102,406 @@ class {class_name}(mango.MangoModule):
     depends_on = ()  # names of other modules this one imports from
 '''  # starter file content for a freshly scaffolded module
 
+_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")  # lowercase snake_case: what both a Python package name and a module name need to be
 
-def new_module(name: str, directory: str = ".") -> Path:
-    """Write a starter module.py for `name` into `directory/<name>/module.py`."""
+
+def _validate_identifier(name: str, *, kind: str) -> None:
+    """Raise ValueError with an actionable message if `name` isn't a
+    valid lowercase snake_case identifier — catches the common mistakes
+    (spaces, hyphens, a leading digit, mixed case) before they turn into
+    a confusing failure inside module import or file scaffolding.
+    """
+    if not _NAME_RE.match(name):
+        raise ValueError(
+            f"{kind} name {name!r} is invalid — use lowercase letters, digits, "
+            f"and underscores, starting with a letter (e.g. {_suggest(name)!r})"
+        )
+
+
+def _suggest(name: str) -> str:
+    """Best-effort valid-identifier suggestion for an invalid name, shown in the error message."""
+    cleaned = re.sub(r"[^a-z0-9_]+", "_", name.strip().lower()).strip("_") or "my_project"
+    if cleaned[0].isdigit():
+        cleaned = f"_{cleaned}"
+    return cleaned
+
+
+def _find_manifest(start: Path) -> Path | None:
+    """Walk upward from `start` looking for `project.mango`, the way a
+    build tool walks up looking for tsconfig.json/package.json — so
+    `mango new-module`/`init-migrations` work correctly whether run from
+    the project root or a subdirectory."""
+    current = start.resolve()
+    for candidate in (current, *current.parents):
+        manifest = candidate / MANIFEST_FILENAME
+        if manifest.is_file():
+            return manifest
+    return None
+
+
+def _load_manifest(manifest: Path) -> dict:
+    """Parse a `project.mango` file (plain TOML) into a dict."""
+    with manifest.open("rb") as f:
+        return tomllib.load(f)
+
+
+def _wire_into_registry(registry_path: Path, module_dotted_path: str) -> bool:
+    """Append `import {module_dotted_path}.module  # noqa: F401` to the
+    project's registry.py, if it exists and doesn't already have that
+    line. Returns True if the file was written to, False if it already
+    contained the import or doesn't exist (caller falls back to printing
+    the line for the user to add by hand)."""
+    if not registry_path.is_file():
+        return False
+    line = f"import {module_dotted_path}.module  # noqa: F401"
+    existing = registry_path.read_text(encoding="utf-8")
+    if line in existing:
+        return False
+    separator = "" if existing.endswith("\n") or not existing else "\n"
+    registry_path.write_text(existing + separator + line + "\n", encoding="utf-8")
+    return True
+
+
+def _unwire_from_registry(registry_path: Path, module_dotted_path: str) -> bool:
+    """Remove `import {module_dotted_path}.module  # noqa: F401` from the
+    project's registry.py, if present — the inverse of `_wire_into_registry`,
+    used by `remove_module`. Returns True if the file was changed."""
+    if not registry_path.is_file():
+        return False
+    line = f"import {module_dotted_path}.module  # noqa: F401"
+    lines = registry_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    kept = [ln for ln in lines if ln.rstrip("\n") != line]
+    if len(kept) == len(lines):
+        return False
+    registry_path.write_text("".join(kept), encoding="utf-8")
+    return True
+
+
+def _resolve_project_root(directory: str | None) -> Path:
+    """Resolve the project root a `routes`/`modules`/`doctor`/`migrate`
+    invocation operates on: `directory` itself if given (must contain
+    `project.mango`), otherwise auto-detected by walking upward from the
+    current directory — same discovery `new-module`/`init-migrations` use.
+    """
+    if directory is not None:
+        root = Path(directory).resolve()
+        if not (root / MANIFEST_FILENAME).is_file():
+            raise ValueError(f"{root} has no {MANIFEST_FILENAME} — not a mango project root")
+        return root
+    manifest_path = _find_manifest(Path.cwd())
+    if manifest_path is None:
+        raise ValueError(
+            f"no {MANIFEST_FILENAME} found — run this from inside a project scaffolded by "
+            "`mango init`, or pass the project directory explicitly"
+        )
+    return manifest_path.parent
+
+
+def _import_dotted(module_path: str, root: Path):
+    """Import `module_path` (e.g. "app.registry") with `root` prepended to
+    `sys.path`, so a project's own package resolves the way running
+    `python -m app.main` from the project root would. Wraps import
+    failures (a missing `DATABASE_URL`, a typo in the manifest, ...) in a
+    ValueError carrying the underlying message — `main()` already renders
+    ValueError as a clean one-line error instead of a raw traceback."""
+    root_str = str(root)
+    if root_str not in sys.path:
+        sys.path.insert(0, root_str)
+    try:
+        return importlib.import_module(module_path)
+    except Exception as exc:
+        raise ValueError(f"failed to import {module_path!r}: {exc}") from exc
+
+
+def _dotted_path(rel_path: str) -> str:
+    """Turn a manifest path like "app/registry.py" or "app/modules" into
+    its dotted import form ("app.registry" / "app.modules")."""
+    stripped = rel_path[:-3] if rel_path.endswith(".py") else rel_path
+    return stripped.replace("/", ".").replace("\\", ".").strip(".")
+
+
+def new_module(name: str, directory: str | None = None) -> tuple[Path, bool]:
+    """Write a starter module.py for `name` into `directory/<name>/module.py`.
+
+    If `directory` is omitted, auto-detects the enclosing project via its
+    `project.mango` manifest and defaults to that project's `modules_dir`
+    (falling back to the current directory if no manifest is found). When
+    a manifest is found, also auto-wires the new module's import into the
+    project's `registry` file.
+
+    Returns `(target_file, wired)` — `wired` is True if the registry file
+    was updated automatically, False if the caller still needs to add the
+    import line by hand (no manifest, or no registry file).
+    """
+    _validate_identifier(name, kind="module")
+
+    manifest = None
+    if directory is None:
+        manifest_path = _find_manifest(Path.cwd())
+        if manifest_path is not None:
+            manifest = _load_manifest(manifest_path)
+            directory = str(manifest_path.parent / manifest.get("modules_dir", "app/modules"))
+        else:
+            directory = "."
+
     class_name = "".join(part.capitalize() for part in name.split("_")) + "Module"  # e.g. "user_profile" -> "UserProfileModule"
     target_dir = Path(directory) / name  # the new module's own subdirectory
-    target_dir.mkdir(parents=True, exist_ok=True)
     target_file = target_dir / "module.py"  # the single generated file
     if target_file.exists():
         raise FileExistsError(f"{target_file} already exists")
+    target_dir.mkdir(parents=True, exist_ok=True)
 
     content = _MODULE_TEMPLATE.format(
         path=f"{name}/module.py", name=name, class_name=class_name
     )  # rendered template with the module's name substituted in
     target_file.write_text(content, encoding="utf-8")
-    return target_file
+
+    wired = False
+    if manifest is not None:
+        registry_path = manifest_path.parent / manifest.get("registry", "app/registry.py")
+        module_dotted_path = ".".join(target_dir.relative_to(manifest_path.parent).parts)
+        wired = _wire_into_registry(registry_path, module_dotted_path)
+
+    return target_file, wired
+
+
+def remove_module(name: str, directory: str | None = None) -> tuple[Path, bool]:
+    """Delete a module's directory — the inverse of `new_module`.
+
+    If `directory` is omitted, auto-detects the enclosing project via its
+    `project.mango` manifest the same way `new_module` does, and also
+    un-wires the module's import from the project's `registry` file.
+
+    Returns `(deleted_dir, unwired)` — `unwired` is True if the registry
+    import was removed automatically, False if the caller still needs to
+    remove it by hand (no manifest, or no matching import found).
+
+    Raises:
+        ValueError: if the target directory doesn't exist.
+    """
+    manifest = None
+    manifest_path = None
+    if directory is None:
+        manifest_path = _find_manifest(Path.cwd())
+        if manifest_path is not None:
+            manifest = _load_manifest(manifest_path)
+            directory = str(manifest_path.parent / manifest.get("modules_dir", "app/modules"))
+        else:
+            directory = "."
+
+    target_dir = Path(directory) / name
+    if not target_dir.is_dir():
+        raise ValueError(f"{target_dir} does not exist")
+    shutil.rmtree(target_dir)
+
+    unwired = False
+    if manifest is not None:
+        registry_path = manifest_path.parent / manifest.get("registry", "app/registry.py")
+        module_dotted_path = ".".join(target_dir.relative_to(manifest_path.parent).parts)
+        unwired = _unwire_from_registry(registry_path, module_dotted_path)
+
+    return target_dir, unwired
 
 
 def init_project_command(name: str, directory: str = ".") -> Path:
-    """CLI wrapper: scaffold a full project named `name` into `directory/name/`."""
+    """CLI wrapper: scaffold a full project named `name` into `directory/name/` —
+    or, if `name` is `"."`, in place into `directory` itself (name inferred from
+    that directory), for the common "already made and cd'd into an empty folder"
+    case. Skips name validation for `"."` since the project name there comes
+    from the (already-existing, not newly chosen) directory name."""
+    if name != ".":
+        _validate_identifier(name, kind="project")
     return init_project(name, directory)
 
 
-def init_migrations_command(base_import: str, directory: str = ".") -> Path:
+def init_migrations_command(base_import: str | None, directory: str | None) -> Path:
     """CLI wrapper: scaffold alembic.ini + migrations/ into `directory`,
-    wired to the declarative Base at `base_import` ("module.path:Base")."""
+    wired to the declarative Base at `base_import` ("module.path:Base").
+
+    Both arguments fall back to the enclosing project's `project.mango`
+    manifest (`base_import`, and the manifest's own directory) if omitted.
+    """
+    manifest_path = None
+    if base_import is None or directory is None:
+        manifest_path = _find_manifest(Path.cwd())
+        if manifest_path is None:
+            raise ValueError(
+                "no base_import given and no project.mango manifest found — "
+                'pass it explicitly, e.g. mango init-migrations "app.db:Base"'
+            )
+        manifest = _load_manifest(manifest_path)
+        if base_import is None:
+            base_import = manifest.get("base_import")
+            if not base_import:
+                raise ValueError(f"{manifest_path} has no base_import set")
+        if directory is None:
+            directory = str(manifest_path.parent)
+
+    if ":" not in base_import:
+        raise ValueError(
+            f'base_import {base_import!r} is missing ":AttributeName" — '
+            f'pass it as "module.path:Base" (e.g. "app.db:Base")'
+        )
     return init_migrations(directory, base_import=base_import)
+
+
+def modules_command(directory: str | None = None) -> list[dict]:
+    """List every registered module, in mount order, by importing the
+    project's registry.py (which registers each module as an import-time
+    side effect — see mango/module.py) and reusing `App`'s own topological
+    sort. Each entry: `{"name", "prefix", "depends_on", "has_router"}`.
+    """
+    root = _resolve_project_root(directory)
+    manifest = _load_manifest(root / MANIFEST_FILENAME)
+    registry_dotted = _dotted_path(manifest.get("registry", "app/registry.py"))
+    _import_dotted(registry_dotted, root)  # side effect: runs every @mango.module decorator
+
+    from mango.app import _topological_order
+    from mango.module import get_registry
+
+    specs = get_registry()
+    order = _topological_order(specs)
+    return [
+        {
+            "name": name,
+            "prefix": specs[name].prefix,
+            "depends_on": list(specs[name].depends_on),
+            "has_router": specs[name].router is not None,
+        }
+        for name in order
+    ]
+
+
+def routes_command(directory: str | None = None) -> list[dict]:
+    """List every currently-mounted HTTP route by importing the project's
+    `app_import` (default `app.main:app`, per project.mango) and calling
+    its `.routes()` — requires that import to actually build and mount a
+    `mango.App` (as the generated `app/main.py` does at module level), so
+    the project's runtime dependencies (e.g. `DATABASE_URL`) must be
+    available the same as running the app itself would need.
+    """
+    root = _resolve_project_root(directory)
+    manifest = _load_manifest(root / MANIFEST_FILENAME)
+    app_import = manifest.get("app_import", "app.main:app")
+    if ":" not in app_import:
+        raise ValueError(f'project.mango app_import {app_import!r} is missing ":AttributeName"')
+    module_path, attr = app_import.split(":", 1)
+    module = _import_dotted(module_path, root)
+    if not hasattr(module, attr):
+        raise ValueError(f"{app_import!r} has no attribute {attr!r}")
+    app_obj = getattr(module, attr)
+    if not hasattr(app_obj, "routes"):
+        raise ValueError(f"{app_import!r} doesn't look like a mango.App instance (no .routes())")
+    return app_obj.routes()
+
+
+def doctor_command(directory: str | None = None) -> list[dict]:
+    """Sanity-check an existing project for drift a hand-edit can
+    introduce that `new-module`/`remove_module`'s auto-wiring doesn't
+    protect against: a module folder created or deleted by hand without
+    updating registry.py, a missing `.env`, or a `pyproject.toml` that
+    lost its `mangoframe` dependency. Each entry: `{"name", "ok", "detail"}`.
+    """
+    root = _resolve_project_root(directory)
+    manifest = _load_manifest(root / MANIFEST_FILENAME)
+    checks: list[dict] = []
+
+    modules_dir = root / manifest.get("modules_dir", "app/modules")
+    checks.append({"name": "modules_dir exists", "ok": modules_dir.is_dir(), "detail": str(modules_dir)})
+
+    registry_path = root / manifest.get("registry", "app/registry.py")
+    checks.append({"name": "registry file exists", "ok": registry_path.is_file(), "detail": str(registry_path)})
+    registry_text = registry_path.read_text(encoding="utf-8") if registry_path.is_file() else ""
+
+    if modules_dir.is_dir():
+        modules_dotted_prefix = _dotted_path(str(modules_dir.relative_to(root)))
+        on_disk = sorted(p.parent.name for p in modules_dir.glob("*/module.py"))  # every module folder that actually has a module.py
+        orphans = [
+            name for name in on_disk
+            if f"import {modules_dotted_prefix}.{name}.module" not in registry_text
+        ]
+        checks.append({
+            "name": "every module on disk is wired into registry.py",
+            "ok": not orphans,
+            "detail": ("orphan modules (created but never imported): " + ", ".join(orphans)) if orphans else "all wired",
+        })
+
+        wired_names = {
+            line.split()[1][len(modules_dotted_prefix) + 1 : -len(".module")]
+            for line in registry_text.splitlines()
+            if line.strip().startswith(f"import {modules_dotted_prefix}.") and line.strip().endswith(".module  # noqa: F401")
+        }
+        stale = sorted(name for name in wired_names if not (modules_dir / name / "module.py").is_file())
+        checks.append({
+            "name": "registry.py has no stale imports",
+            "ok": not stale,
+            "detail": ("imports pointing at deleted modules: " + ", ".join(stale)) if stale else "none",
+        })
+
+    env_example = root / ".env.example"
+    if env_example.is_file():
+        env_file = root / ".env"
+        checks.append({
+            "name": ".env present",
+            "ok": env_file.is_file(),
+            "detail": str(env_file) if env_file.is_file() else "missing — copy .env.example and fill in DATABASE_URL",
+        })
+
+    pyproject = root / "pyproject.toml"
+    if pyproject.is_file():
+        has_dependency = "mangoframe" in pyproject.read_text(encoding="utf-8")
+        checks.append({
+            "name": "pyproject.toml depends on mangoframe",
+            "ok": has_dependency,
+            "detail": "ok" if has_dependency else "no 'mangoframe' entry in [project.dependencies]",
+        })
+
+    return checks
+
+
+def migrate_command(message: str = "auto", directory: str | None = None) -> None:
+    """Run the two-command Alembic loop (`revision --autogenerate` then
+    `upgrade head`) every model change requires — via `python -m alembic`
+    (not a bare `alembic` on PATH, which may not resolve to the right
+    virtualenv). Output streams straight through so Alembic's own
+    progress/errors are visible, not swallowed.
+
+    Raises:
+        ValueError: if the project has no `alembic.ini` yet (run
+            `mango init-migrations` first), or either Alembic step exits
+            non-zero.
+    """
+    root = _resolve_project_root(directory)
+    if not (root / "alembic.ini").is_file():
+        raise ValueError(f"{root / 'alembic.ini'} not found — run `mango init-migrations` first")
+
+    revision = subprocess.run(
+        [sys.executable, "-m", "alembic", "revision", "--autogenerate", "-m", message], cwd=root
+    )
+    if revision.returncode != 0:
+        raise ValueError(f"alembic revision --autogenerate failed (exit {revision.returncode})")
+
+    upgrade = subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"], cwd=root)
+    if upgrade.returncode != 0:
+        raise ValueError(f"alembic upgrade head failed (exit {upgrade.returncode})")
+
+
+_QUICKSTART = """\
+mango - FastAPI + SQLAlchemy, without the boilerplate.
+
+No command given - here's how to get started:
+
+  mango init my_shop              # scaffold a new project into ./my_shop
+  cd my_shop
+  mango new-module items app/modules   # add a module
+
+Then wire the module into app/registry.py, set DATABASE_URL, and run:
+
+  python -m app.main
+
+Run `mango <command> --help` for details on any command, or
+`mango --help` for the full list.
+"""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -94,6 +509,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mango",
         description="Scaffolding for mango projects — a new project, a new module, or a new project's Alembic setup.",
+        epilog=(
+            "examples:\n"
+            "  mango init my_shop\n"
+            "  mango new-module items\n"
+            "  mango init-migrations\n"
+            "  mango migrate \"add items table\"\n"
+            "  mango routes\n"
+            "  mango modules\n"
+            "  mango doctor\n"
+            "\n"
+            "Full guide: https://github.com/rhydham-mittal27/mango/blob/main/docs/GUIDE.md"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )  # the top-level parser
     parser.add_argument(
         "--version", action="version", version=f"mango {__version__}"
@@ -102,32 +530,165 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command")  # dest="command" so main() can dispatch on it
 
     init_parser = subcommands.add_parser(
-        "init", help="Scaffold a new project (pyproject.toml, app/main.py, app/registry.py, app/db.py, ...)."
+        "init",
+        help="Scaffold a new project (pyproject.toml, app/main.py, app/registry.py, app/db.py, ...).",
+        description="Scaffold a new project's full folder structure.",
+        epilog=(
+            "example:\n"
+            "  mango init my_shop\n"
+            "  mango init my_shop ~/code   # create ~/code/my_shop instead of ./my_shop\n"
+            "  mango init .                # scaffold THIS directory in place, no nested subfolder"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    init_parser.add_argument("name", help="The new project's name (also its directory name).")
     init_parser.add_argument(
-        "directory", nargs="?", default=".", help="Where to create the project (default: current directory)."
+        "name",
+        help=(
+            "The new project's name (lowercase snake_case, also its directory name), e.g. my_shop. "
+            'Pass "." to scaffold the target directory in place instead of creating a new subdirectory '
+            "for it — the project's name is then taken from that directory's own name."
+        ),
     )
-
-    new_module_parser = subcommands.add_parser(
-        "new-module", help="Scaffold a starter module.py for a new module."
-    )
-    new_module_parser.add_argument("name", help="The new module's name (also its subdirectory name).")
-    new_module_parser.add_argument(
+    init_parser.add_argument(
         "directory",
         nargs="?",
         default=".",
-        help="Where to create the module's directory, e.g. app/modules (default: current directory).",
+        help="Where to create the project (default: current directory). Ignored as a name source when name is \".\".",
+    )
+
+    new_module_parser = subcommands.add_parser(
+        "new-module",
+        help="Scaffold a starter module.py for a new module.",
+        description="Scaffold a starter module.py for a new module.",
+        epilog=(
+            "example:\n"
+            "  mango new-module items\n"
+            "\n"
+            "Run from anywhere inside a project scaffolded by `mango init` and\n"
+            "this auto-detects the project via its project.mango manifest,\n"
+            "creates the module under its modules_dir, and wires the import\n"
+            "into its registry.py for you — pass `directory` explicitly to\n"
+            "override either behavior."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    new_module_parser.add_argument(
+        "name", help="The new module's name (lowercase snake_case, also its subdirectory name), e.g. items."
+    )
+    new_module_parser.add_argument(
+        "directory",
+        nargs="?",
+        default=None,
+        help=(
+            "Where to create the module's directory, e.g. app/modules. "
+            "Default: auto-detected from the enclosing project's project.mango manifest, "
+            "or the current directory if none is found."
+        ),
     )
 
     init_migrations_parser = subcommands.add_parser(
-        "init-migrations", help="Scaffold an async-aware alembic.ini + migrations/env.py."
+        "init-migrations",
+        help="Scaffold an async-aware alembic.ini + migrations/env.py.",
+        description="Scaffold an async-aware alembic.ini + migrations/env.py, wired to your declarative Base.",
+        epilog=(
+            "example:\n"
+            "  mango init-migrations\n"
+            "  mango init-migrations app.db:Base   # override the manifest's base_import\n"
+            "\n"
+            "Then, as usual with Alembic:\n"
+            "  alembic revision --autogenerate -m \"...\"\n"
+            "  alembic upgrade head"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     init_migrations_parser.add_argument(
-        "base_import", help='Your declarative Base, as "module.path:AttributeName" (e.g. "app.db:Base").'
+        "base_import",
+        nargs="?",
+        default=None,
+        help=(
+            'Your declarative Base, as "module.path:AttributeName" (e.g. "app.db:Base"). '
+            "Default: read from the enclosing project's project.mango manifest."
+        ),
     )
     init_migrations_parser.add_argument(
-        "directory", nargs="?", default=".", help="Project root to scaffold into (default: current directory)."
+        "directory",
+        nargs="?",
+        default=None,
+        help="Project root to scaffold into. Default: the enclosing project's root, auto-detected via project.mango.",
+    )
+
+    remove_module_parser = subcommands.add_parser(
+        "remove-module",
+        help="Delete a module's directory and un-wire it from registry.py — the inverse of new-module.",
+        description="Delete a module's directory and un-wire it from registry.py.",
+        epilog=(
+            "example:\n"
+            "  mango remove-module items\n"
+            "\n"
+            "Same auto-detection as new-module: run from anywhere inside the\n"
+            "project and this finds the module under its modules_dir and\n"
+            "removes its import from registry.py for you."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    remove_module_parser.add_argument("name", help="The module's name (its subdirectory name), e.g. items.")
+    remove_module_parser.add_argument(
+        "directory",
+        nargs="?",
+        default=None,
+        help="Where the module's directory lives, e.g. app/modules. Default: auto-detected via project.mango.",
+    )
+
+    modules_parser = subcommands.add_parser(
+        "modules",
+        help="List registered modules in mount order.",
+        description="List every registered module (name, prefix, depends_on) in mount order.",
+        epilog="example:\n  mango modules",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    modules_parser.add_argument(
+        "directory", nargs="?", default=None, help="Project root. Default: auto-detected via project.mango."
+    )
+
+    routes_parser = subcommands.add_parser(
+        "routes",
+        help="List every mounted HTTP route.",
+        description="List every mounted HTTP route (method, path, name) — no need to boot the server and check /docs.",
+        epilog="example:\n  mango routes",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    routes_parser.add_argument(
+        "directory", nargs="?", default=None, help="Project root. Default: auto-detected via project.mango."
+    )
+
+    doctor_parser = subcommands.add_parser(
+        "doctor",
+        help="Sanity-check an existing project for drift (orphan/stale registry imports, missing .env, ...).",
+        description="Sanity-check an existing project: modules on disk vs. registry.py, missing .env, dependency drift.",
+        epilog="example:\n  mango doctor",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    doctor_parser.add_argument(
+        "directory", nargs="?", default=None, help="Project root. Default: auto-detected via project.mango."
+    )
+
+    migrate_parser = subcommands.add_parser(
+        "migrate",
+        help="Run `alembic revision --autogenerate` + `upgrade head` in one step.",
+        description="Wraps the two-command Alembic loop every model change requires.",
+        epilog=(
+            "example:\n"
+            '  mango migrate "add items table"\n'
+            "\n"
+            "Requires `mango init-migrations` to have run already."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    migrate_parser.add_argument(
+        "message", nargs="?", default="auto", help='Revision message (default: "auto").'
+    )
+    migrate_parser.add_argument(
+        "directory", nargs="?", default=None, help="Project root. Default: auto-detected via project.mango."
     )
 
     return parser
@@ -139,19 +700,72 @@ def main() -> None:
     args = parser.parse_args()  # parsed CLI arguments; argparse itself handles --help/bad-args/exits
 
     if args.command is None:
-        parser.print_help()
-        raise SystemExit(1)
+        print(_QUICKSTART)
+        return
 
     try:
         if args.command == "init":
             path = init_project_command(args.name, args.directory)
-            print(f"created {path}/")
+            print(f"created {path}/\n")
+            print("next steps:")
+            if args.name != ".":
+                print(f"  cd {path}")  # in-place mode: already there, no cd needed
+            print('  pip install -e ".[dev]"')
+            print("  cp .env.example .env   # then edit DATABASE_URL")
+            print("  python -m app.main")
         elif args.command == "new-module":
-            path = new_module(args.name, args.directory)
+            path, wired = new_module(args.name, args.directory)
             print(f"created {path}")
+            if wired:
+                print("wired into registry.py automatically")
+            else:
+                print("\nnext step: wire it up in app/registry.py:")
+                module_import = str(path.parent).replace("/", ".").replace("\\", ".") + ".module"
+                print(f"  import {module_import}  # noqa: F401")
         elif args.command == "init-migrations":
             path = init_migrations_command(args.base_import, args.directory)
-            print(f"created {path} and {Path(args.directory) / 'migrations'}/")
+            print(f"created {path} and {path.parent / 'migrations'}/\n")
+            print("next steps:")
+            print('  alembic revision --autogenerate -m "..."')
+            print("  alembic upgrade head")
+        elif args.command == "remove-module":
+            path, unwired = remove_module(args.name, args.directory)
+            print(f"removed {path}")
+            if unwired:
+                print("un-wired from registry.py automatically")
+            else:
+                print("\nnext step: remove its import from app/registry.py by hand.")
+        elif args.command == "modules":
+            modules = modules_command(args.directory)
+            if not modules:
+                print("no modules registered")
+            for i, mod in enumerate(modules, start=1):
+                router_note = "" if mod["has_router"] else "  (no router)"
+                deps = f"depends_on={mod['depends_on']}" if mod["depends_on"] else ""
+                prefix = f"prefix={mod['prefix']!r}" if mod["prefix"] else ""
+                extras = "  ".join(part for part in (prefix, deps) if part)
+                print(f"{i}. {mod['name']}{router_note}" + (f"  {extras}" if extras else ""))
+        elif args.command == "routes":
+            routes = routes_command(args.directory)
+            if not routes:
+                print("no routes mounted")
+            for route in sorted(routes, key=lambda r: (r["path"], r["methods"])):
+                methods = ",".join(route["methods"]) or "-"
+                print(f"{methods:<12} {route['path']}")
+        elif args.command == "doctor":
+            checks = doctor_command(args.directory)
+            failed = [c for c in checks if not c["ok"]]
+            for check in checks:
+                status = "ok  " if check["ok"] else "FAIL"
+                print(f"[{status}] {check['name']}: {check['detail']}")
+            print()
+            if failed:
+                print(f"{len(failed)} check(s) failed")
+                raise SystemExit(1)
+            print("all checks passed")
+        elif args.command == "migrate":
+            migrate_command(args.message, args.directory)
+            print("\nmigration created and applied")
     except (FileExistsError, ValueError) as exc:
         # Expected, user-actionable failures (target already exists, malformed
         # base_import, ...) — a clean one-line message, not a Python traceback.

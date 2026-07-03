@@ -7,10 +7,12 @@ expected files exist and contain the expected wiring.
 
 Classes: none — pytest test functions only.
 
-Functions (3):
+Functions (5):
     - test_init_project_scaffolds_expected_files
     - test_init_project_rejects_existing_directory
     - test_scaffolded_main_imports_registry_and_mounts
+    - test_init_project_in_place_infers_name_from_directory
+    - test_init_project_in_place_rejects_conflicting_files
 """
 import pytest
 
@@ -53,3 +55,31 @@ def test_scaffolded_main_imports_registry_and_mounts(tmp_path):
     db_contents = (root / "app" / "db.py").read_text(encoding="utf-8")
     assert "class Base(DeclarativeBase)" in db_contents
     assert "mango.Database(" in db_contents
+
+
+def test_init_project_in_place_infers_name_from_directory(tmp_path):
+    """init_project(".", directory) scaffolds directory itself (no nested
+    subfolder), taking the project name from the directory's own name."""
+    target = tmp_path / "my_cool_app"
+    target.mkdir()
+
+    root = mango.init_project(".", str(target))
+
+    assert root == target.resolve()
+    assert (root / "pyproject.toml").exists()
+    assert (root / "app" / "main.py").exists()
+    assert (root / "project.mango").exists()
+    assert 'name = "my-cool-app"' in (root / "pyproject.toml").read_text(encoding="utf-8")
+    assert "# my_cool_app" in (root / "README.md").read_text(encoding="utf-8")
+
+
+def test_init_project_in_place_rejects_conflicting_files(tmp_path):
+    """Re-running init_project(".", ...) against a directory that already
+    has scaffolded files raises, naming the conflicts, rather than
+    silently overwriting them."""
+    target = tmp_path / "my_cool_app"
+    target.mkdir()
+    mango.init_project(".", str(target))
+
+    with pytest.raises(FileExistsError, match="pyproject.toml"):
+        mango.init_project(".", str(target))

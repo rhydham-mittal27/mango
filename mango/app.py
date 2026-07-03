@@ -19,8 +19,10 @@ Classes (2):
     - App: the full wrapper — creates and owns the FastAPI instance
       itself, is directly ASGI-callable (`uvicorn mymodule:app`), and
       exposes get/post/put/patch/delete/add_middleware/use/on_startup/
-      on_shutdown/mount_all/run — so a consumer never needs
-      `from fastapi import FastAPI` at all.
+      on_shutdown/mount_all/routes/run — so a consumer never needs
+      `from fastapi import FastAPI` at all. `routes()` lists every
+      currently-mounted endpoint (path/methods/name); `mango routes`
+      (mango/cli.py) uses it for CLI introspection.
 
 Functions (1):
     - _topological_order: internal — orders module names so every
@@ -206,6 +208,20 @@ class App:
     def mount_all(self) -> list[str]:
         """Include every registered module's router, in dependency order. See MangoApp.mount_all()."""
         return self._mango_app.mount_all()
+
+    def routes(self) -> list[dict[str, Any]]:
+        """Every currently-mounted HTTP route, as `{"path", "methods", "name"}`
+        dicts — call after `mount_all()` for the full picture. Used by
+        `mango routes` for CLI introspection; also handy in a startup hook
+        for logging what actually got mounted."""
+        result: list[dict[str, Any]] = []
+        for route in self._fastapi.routes:
+            path = getattr(route, "path", None)  # None for non-HTTP routes (e.g. mounted sub-apps, websockets w/o .path)
+            if path is None:
+                continue
+            methods = sorted(getattr(route, "methods", None) or [])  # HTTP methods this route responds to
+            result.append({"path": path, "methods": methods, "name": getattr(route, "name", "")})
+        return result
 
     def add_middleware(self, middleware_cls: type, **options: Any) -> None:
         """Add ASGI middleware to the underlying FastAPI app."""

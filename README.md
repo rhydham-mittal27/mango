@@ -66,8 +66,16 @@ REST endpoint set — 404s, pagination, error handling, all included. No
 pip install mangoframe
 mango init demo_shop
 cd demo_shop
-mango new-module items app/modules
+mango new-module items
 ```
+
+`mango new-module` auto-detects the project via `project.mango` (written
+by `mango init`) and wires the new module into `app/registry.py` for you
+— run it from anywhere inside the project, no directory argument needed.
+
+Already made and `cd`'d into an empty folder (maybe one `git init` ran
+in already)? `mango init .` scaffolds it in place instead of nesting a
+redundant subdirectory — the project name is taken from the folder.
 
 ```python
 # app/main.py — generated for you, shown here for reference
@@ -142,6 +150,17 @@ migrating incrementally) works alongside mango without conversion.
   its own session and a logged (not swallowed) exception on failure.
 - **`init_migrations` / `init_project`** — scaffold Alembic and a whole
   new project's folder structure, via the `mango` CLI.
+- **`mango modules` / `mango routes`** — list registered modules (mount
+  order, `depends_on`) or every mounted HTTP route, without booting the
+  server and clicking through `/docs`.
+- **`mango remove-module`** — deletes a module's directory and un-wires
+  its `registry.py` import; the inverse of `new-module`.
+- **`mango doctor`** — sanity-checks an existing project: modules
+  created by hand but never wired into `registry.py` (or the reverse —
+  a stale import pointing at a deleted module), a missing `.env`, a
+  `pyproject.toml` that lost its `mangoframe` dependency.
+- **`mango migrate "<message>"`** — wraps the two-command Alembic loop
+  (`revision --autogenerate` + `upgrade head`) every model change needs.
 
 Full tour with examples: **[docs/GUIDE.md](docs/GUIDE.md)**.
 Folder-structure convention and the reasoning behind it:
