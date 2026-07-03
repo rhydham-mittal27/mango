@@ -6,6 +6,13 @@ backend repeats — a module only needs custom query methods for logic
 that's genuinely specific to it (e.g. "accepted applications older than
 a cutoff").
 
+`get()`/`exists()`/`get_or_404()` all support composite primary keys —
+pass `id_` as a tuple in `model.__mapper__.primary_key` order (the same
+shape SQLAlchemy's own `Session.get()` already expects) instead of a
+scalar. A pure join-table model (e.g. a many-to-many association row)
+is the common case for this: a composite `(a_id, b_id)` primary key
+needs no surrogate id column.
+
 Classes (1):
     - MangoRepository: generic async repository over a single ORM model.
 
@@ -42,6 +49,11 @@ class MangoRepository(Generic[ModelT]):
     async def get(self, id_: object, *, options: Sequence[Any] = ()) -> ModelT | None:
         """Fetch a single row by primary key, or None if it doesn't exist.
 
+        `id_` is a scalar for a single-column primary key, or a tuple (in
+        column order — see `self.model.__mapper__.primary_key`) for a
+        composite one; the no-`options` path already delegates to
+        `Session.get()`, which supports both natively.
+
         `options` takes SQLAlchemy loader options (e.g.
         `selectinload(Model.children)`) for eager-loading relationships
         — without them, accessing a lazy relationship on the returned
@@ -51,7 +63,7 @@ class MangoRepository(Generic[ModelT]):
         relationships worth eager-loading on every fetch.
         """
         if options:
-            stmt = select(self.model).where(self._pk_column() == id_).options(*options)
+            stmt = select(self.model).where(self._pk_where(id_)).options(*options)
             result = await self.session.execute(stmt)
             return result.scalar_one_or_none()
         return await self.session.get(self.model, id_)
@@ -66,8 +78,10 @@ class MangoRepository(Generic[ModelT]):
         return entity
 
     async def exists(self, id_: object) -> bool:
-        """Whether a row with this primary key exists, without loading it."""
-        stmt = select(func.count()).select_from(self.model).where(self._pk_column() == id_)
+        """Whether a row with this primary key exists, without loading it.
+        Same `id_` shape as `get()` — scalar or, for a composite key, a
+        tuple in column order."""
+        stmt = select(func.count()).select_from(self.model).where(self._pk_where(id_))
         result = await self.session.execute(stmt)
         return result.scalar_one() > 0
 
@@ -140,15 +154,32 @@ class MangoRepository(Generic[ModelT]):
         result = await self.session.execute(stmt)  # execute against the current session
         return result.scalar_one()
 
-    def _pk_column(self):
-        """Resolve this model's single primary-key column, for exists()/get() with options()."""
-        pk_columns = list(self.model.__mapper__.primary_key)  # this model's primary-key column(s)
-        if len(pk_columns) != 1:
+    def _pk_columns(self) -> list:
+        """This model's primary-key column(s), in `Session.get()`'s own
+        tuple-identity order — used to build a WHERE clause matching
+        either a scalar (single-column PK) or tuple (composite PK) id_."""
+        return list(self.model.__mapper__.primary_key)
+
+    def _pk_where(self, id_: object):
+        """WHERE clause matching `id_` against this model's primary key —
+        `id_` is a scalar for a single-column PK, or a tuple (in
+        `_pk_columns()` order) for a composite one. Raises ValueError if
+        a composite-key model is given a non-tuple or wrong-length id_,
+        instead of silently building a clause that matches nothing."""
+        columns = self._pk_columns()
+        if len(columns) == 1:
+            return columns[0] == id_
+        if not isinstance(id_, (tuple, list)) or len(id_) != len(columns):
+            column_names = ", ".join(c.name for c in columns)
             raise ValueError(
-                f"{self.model.__name__} has a composite or missing primary key; "
-                "exists()/get(options=...) only support a single-column primary key"
+                f"{self.model.__name__} has a composite primary key ({column_names}) — "
+                f"pass id_ as a {len(columns)}-tuple in that column order, got {id_!r}"
             )
-        return pk_columns[0]
+        conditions = [column == value for column, value in zip(columns, id_)]
+        clause = conditions[0]
+        for condition in conditions[1:]:
+            clause = clause & condition
+        return clause
 
     async def search(
         self, query: str | None = None, *, limit: int = 50, offset: int = 0
