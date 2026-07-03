@@ -8,6 +8,21 @@ always be listed under "Changed"/"Removed" below, never silent.
 
 ## [Unreleased]
 
+## [0.6.0]
+
+### Fixed
+- `mango init-migrations`/`mango.init_migrations` produced empty
+  migrations — `env.py` only imported `base_import` (e.g. `app.db:Base`),
+  which never imports any model module, so `Base.metadata` was empty at
+  `alembic revision --autogenerate` time. Added `models_import` (a
+  dotted module path to import for its model-registration side effect,
+  e.g. a project's `registry` module) to `init_migrations`; the CLI now
+  auto-fills it from `project.mango`'s `registry` field, even when
+  `base_import`/`directory` are given explicitly. Found via an
+  end-to-end mangoframe project build (a full-scale e-commerce API) —
+  the first migration silently generated `pass`/`pass` for both
+  `upgrade()`/`downgrade()` until this was fixed.
+
 ## [0.5.0]
 
 ### Added

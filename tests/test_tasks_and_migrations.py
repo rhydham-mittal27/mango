@@ -5,13 +5,20 @@ background work) and mango.init_migrations (Alembic scaffolding).
 
 Classes: none — pytest test functions only.
 
-Functions (4):
+Functions (6):
     - test_run_in_background_runs_and_is_awaitable_via_task
     - test_run_in_background_logs_exception_without_raising: a failing
       background task's exception is logged, not raised into the caller.
     - test_database_spawn_commits_on_success: db.spawn's session commits
       a row that a fresh session can then read back.
     - test_init_migrations_scaffolds_expected_files
+    - test_init_migrations_without_models_import_omits_it: backward-compat
+      — no models_import means no extra import line, as before.
+    - test_init_migrations_with_models_import_registers_models: the fix —
+      without this, `alembic revision --autogenerate` silently diffs
+      against an empty Base.metadata (see mango/cli.py's
+      init_migrations_command, which defaults this from project.mango's
+      `registry` field).
 """
 import asyncio
 import uuid
@@ -85,3 +92,27 @@ def test_init_migrations_scaffolds_expected_files(tmp_path):
     env_contents = (tmp_path / "migrations" / "env.py").read_text(encoding="utf-8")
     assert "from app.db import Base" in env_contents
     assert 'os.environ["DATABASE_URL"]' in env_contents
+
+
+def test_init_migrations_without_models_import_omits_it(tmp_path):
+    """No models_import given -> no extra import line — unchanged from before this option existed."""
+    mango.init_migrations(str(tmp_path), base_import="app.db:Base")
+    env_contents = (tmp_path / "migrations" / "env.py").read_text(encoding="utf-8")
+    assert "Base.metadata" in env_contents
+    assert "import app.registry" not in env_contents
+
+
+def test_init_migrations_with_models_import_registers_models(tmp_path):
+    """models_import is imported right after base_import, so every model
+    module (and therefore every table) is registered on Base.metadata
+    before Alembic reads it — without this, autogenerate silently diffs
+    against an empty metadata and produces an empty migration."""
+    mango.init_migrations(str(tmp_path), base_import="app.db:Base", models_import="app.registry")
+    env_contents = (tmp_path / "migrations" / "env.py").read_text(encoding="utf-8")
+
+    base_import_line = env_contents.index("from app.db import Base")
+    models_import_line = env_contents.index("import app.registry")
+    metadata_line = env_contents.index("Base.metadata")
+
+    assert "import app.registry" in env_contents
+    assert base_import_line < models_import_line < metadata_line

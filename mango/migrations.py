@@ -75,7 +75,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from alembic import context
 
 from {base_module} import {base_attr}
-
+{models_import_line}
 config = context.config
 database_url = os.environ["{database_url_env}"]  # single source of truth for the connection string
 config.set_main_option("sqlalchemy.url", database_url)
@@ -150,7 +150,7 @@ def downgrade() -> None:
 
 
 def init_migrations(
-    directory: str, *, base_import: str, database_url_env: str = "DATABASE_URL"
+    directory: str, *, base_import: str, database_url_env: str = "DATABASE_URL", models_import: str | None = None
 ) -> Path:
     """Scaffold `alembic.ini` + `migrations/` into `directory`.
 
@@ -164,6 +164,18 @@ def init_migrations(
             connection string from at migration-run time. Keep this in
             sync with whatever you pass to `mango.Database(...)` — they
             should be the same connection string, read the same way.
+        models_import: dotted module path that, when imported, has the
+            side effect of importing every one of the project's ORM
+            model modules (typically the project's own `registry`
+            module, since it already imports every module.py — see
+            `mango/cli.py`'s `init_migrations_command`, which defaults
+            this from `project.mango`'s `registry` field). Declaring a
+            model class is what registers its table on `Base.metadata`
+            — importing `base_import` alone does NOT import any model
+            module, so without this, `--autogenerate` silently diffs
+            against an EMPTY metadata and produces an empty migration.
+            Omit only if `base_import` itself already guarantees every
+            model is imported as a side effect.
 
     Returns:
         The path to the created `alembic.ini`.
@@ -185,6 +197,12 @@ def init_migrations(
     versions_dir = migrations_dir / "versions"  # individual revision files go here
     versions_dir.mkdir(parents=True, exist_ok=True)
 
+    models_import_line = (
+        f"import {models_import}  # noqa: F401  (imports every model so Base.metadata is populated before autogenerate reads it)\n"
+        if models_import
+        else ""
+    )
+
     ini_path.write_text(_ALEMBIC_INI, encoding="utf-8")
     (migrations_dir / "env.py").write_text(
         _ENV_PY.format(
@@ -192,6 +210,7 @@ def init_migrations(
             base_module=base_module,
             base_attr=base_attr,
             database_url_env=database_url_env,
+            models_import_line=models_import_line,
         ),
         encoding="utf-8",
     )

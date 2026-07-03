@@ -320,10 +320,17 @@ def init_migrations_command(base_import: str | None, directory: str | None) -> P
 
     Both arguments fall back to the enclosing project's `project.mango`
     manifest (`base_import`, and the manifest's own directory) if omitted.
+    Also passes `models_import` (the manifest's `registry` module, dotted)
+    through to `init_migrations` whenever a manifest is found — even if
+    `base_import`/`directory` were both given explicitly — since without
+    it, `alembic revision --autogenerate` silently diffs against an empty
+    `Base.metadata` (importing `base_import` alone never imports any
+    model module) and produces an empty migration every time.
     """
-    manifest_path = None
+    search_start = Path(directory).resolve() if directory is not None else Path.cwd()
+    manifest_path = _find_manifest(search_start)
+
     if base_import is None or directory is None:
-        manifest_path = _find_manifest(Path.cwd())
         if manifest_path is None:
             raise ValueError(
                 "no base_import given and no project.mango manifest found — "
@@ -342,7 +349,13 @@ def init_migrations_command(base_import: str | None, directory: str | None) -> P
             f'base_import {base_import!r} is missing ":AttributeName" — '
             f'pass it as "module.path:Base" (e.g. "app.db:Base")'
         )
-    return init_migrations(directory, base_import=base_import)
+
+    models_import = None
+    if manifest_path is not None:
+        manifest = _load_manifest(manifest_path)
+        models_import = _dotted_path(manifest.get("registry", "app/registry.py"))
+
+    return init_migrations(directory, base_import=base_import, models_import=models_import)
 
 
 def modules_command(directory: str | None = None) -> list[dict]:
