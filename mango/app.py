@@ -213,14 +213,46 @@ class App:
         """Every currently-mounted HTTP route, as `{"path", "methods", "name"}`
         dicts — call after `mount_all()` for the full picture. Used by
         `mango routes` for CLI introspection; also handy in a startup hook
-        for logging what actually got mounted."""
+        for logging what actually got mounted.
+
+        Walks `self._fastapi.routes` recursively rather than assuming a
+        flat list of leaf routes: newer FastAPI/Starlette versions wrap an
+        `include_router()`'d router in a lazy `_IncludedRouter` proxy
+        instead of eagerly copying its routes with the prefix already
+        baked into each one — that proxy has no `.path` of its own, its
+        real routes live on `.original_router.routes` with paths still
+        relative to `.include_context.prefix`. Older versions (a flat
+        list of routes with `.path` already fully resolved) still work
+        the same way, since a route with its own `.path` is yielded
+        immediately without needing to recurse.
+        """
         result: list[dict[str, Any]] = []
         for route in self._fastapi.routes:
-            path = getattr(route, "path", None)  # None for non-HTTP routes (e.g. mounted sub-apps, websockets w/o .path)
-            if path is None:
-                continue
-            methods = sorted(getattr(route, "methods", None) or [])  # HTTP methods this route responds to
-            result.append({"path": path, "methods": methods, "name": getattr(route, "name", "")})
+            result.extend(self._flatten_route(route, prefix=""))
+        return result
+
+    @staticmethod
+    def _flatten_route(route: Any, *, prefix: str) -> list[dict[str, Any]]:
+        """Yield one dict per leaf HTTP/websocket route reachable from
+        `route`, resolving `prefix` against any nested `_IncludedRouter`-
+        style wrapper. See `routes()`'s docstring for why this recursion
+        exists."""
+        path = getattr(route, "path", None)
+        if path is not None:
+            methods = sorted(getattr(route, "methods", None) or []) or (
+                ["WS"] if "WebSocket" in type(route).__name__ else []
+            )
+            return [{"path": prefix + path, "methods": methods, "name": getattr(route, "name", "")}]
+
+        original_router = getattr(route, "original_router", None)
+        if original_router is None:
+            return []  # not a route and not a recognized wrapper — nothing to report
+
+        include_context = getattr(route, "include_context", None)
+        nested_prefix = prefix + (getattr(include_context, "prefix", "") or "")
+        result: list[dict[str, Any]] = []
+        for sub_route in original_router.routes:
+            result.extend(App._flatten_route(sub_route, prefix=nested_prefix))
         return result
 
     def add_middleware(self, middleware_cls: type, **options: Any) -> None:

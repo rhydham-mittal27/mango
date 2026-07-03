@@ -8,3 +8,7 @@ build/
 .ruff_cache/
 .mypy_cache/
 *.log
+
+# local scratch project used to test mangoframe end-to-end — not part of the package itself
+/ecom_api/
+/saas_api/
