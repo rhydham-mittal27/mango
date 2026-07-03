@@ -8,6 +8,30 @@ always be listed under "Changed"/"Removed" below, never silent.
 
 ## [Unreleased]
 
+## [0.7.0]
+
+### Fixed
+- `App.routes()` (and therefore `mango routes`) silently returned only
+  ad-hoc/framework routes (`/healthz`, `/docs`, `/openapi.json`, ...) —
+  every route mounted via a registered module was missing. Newer FastAPI
+  wraps an `include_router()`'d router in a lazy `_IncludedRouter` proxy
+  instead of eagerly copying its routes with the prefix baked in; that
+  proxy has no `.path` of its own; its real routes live on
+  `.original_router.routes`, still relative to
+  `.include_context.prefix`. `App.routes()` assumed every route has a
+  `.path` directly and silently produced nothing for anything reached
+  through such a wrapper — which, via `MangoApp.mount_all()`'s
+  `include_router()` call, is every module route in every project.
+  Added `App._flatten_route()`, recursing into arbitrarily many levels
+  of this wrapping (a module additionally doing its own
+  `router.include_router(...)` before being mounted is a second level of
+  the same shape). Found building an end-to-end multi-tenant SaaS
+  project — `App.routes()` had no test coverage before this fix, since
+  the existing dev environment's older installed FastAPI never hit this
+  code path; added both a real-environment integration test and a
+  synthetic-stub unit test (independent of which FastAPI version is
+  installed) so this can't silently regress again. Fixes #2.
+
 ## [0.6.0]
 
 ### Fixed
