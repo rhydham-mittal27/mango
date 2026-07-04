@@ -8,6 +8,26 @@ always be listed under "Changed"/"Removed" below, never silent.
 
 ## [Unreleased]
 
+## [0.10.0]
+
+### Added
+- `mango.web` (and therefore `mango`) now re-exports `WebSocket`/
+  `WebSocketDisconnect` — previously missing, forcing a direct
+  `from fastapi import WebSocket, WebSocketDisconnect` for any websocket
+  route, breaking the "never import fastapi directly" convention every
+  other mango-based file follows.
+- `Auth.current_user_ws(param_name="token")` — the websocket-route
+  equivalent of `Auth.current_user()`. `mango.Auth`'s existing
+  dependencies are built on FastAPI's `HTTPBearer`, which reads the
+  `Authorization` HEADER; a browser WebSocket connection can't set
+  custom headers during its handshake, so real-time/collaboration
+  features previously had to duplicate the entire token-verification +
+  user-loading chain by hand instead of reusing `Auth`. `current_user_ws`
+  reads a `?token=` query parameter instead, reusing the same
+  `verify_token`/`load_user` callables passed to `Auth(...)`, and closes
+  the connection itself (with a clean 4401 code) on any auth failure.
+  Fixes #5.
+
 ## [0.9.0]
 
 ### Added

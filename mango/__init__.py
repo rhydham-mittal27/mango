@@ -36,9 +36,12 @@ Classes (20):
       status code, used by services instead of raising HTTPException
       directly.
     - Router, Depends, Query, Path, Body, Header, Cookie, Form, File,
-      UploadFile, Request, Response, JSONResponse, HTTPException: FastAPI
-      primitives re-exported under mango's own namespace (HTTPException
-      is an escape hatch — prefer mango's own exceptions).
+      UploadFile, Request, Response, JSONResponse, HTTPException,
+      WebSocket, WebSocketDisconnect: FastAPI primitives re-exported
+      under mango's own namespace (HTTPException is an escape hatch —
+      prefer mango's own exceptions). `Auth.current_user_ws()` is the
+      websocket-route equivalent of `Auth.current_user()` — see
+      mango/auth.py.
     - SecurityHeadersMiddleware, RateLimitMiddleware: production-
       hardening middleware `App` installs by default (headers) or
       opt-in (rate limiting) — see mango/security.py.
@@ -108,6 +111,8 @@ from mango.web import (
     Response,
     Router,
     UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
     status,
 )
 
@@ -169,5 +174,7 @@ __all__ = [
     "Response",
     "JSONResponse",
     "HTTPException",
+    "WebSocket",
+    "WebSocketDisconnect",
     "status",
 ]

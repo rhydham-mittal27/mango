@@ -21,6 +21,8 @@ from fastapi import (
     Query,
     Request,
     UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
 )
 from fastapi import APIRouter as Router
 from fastapi import Depends as Depends
@@ -44,4 +46,6 @@ __all__ = [
     "Response",
     "JSONResponse",
     "HTTPException",
+    "WebSocket",
+    "WebSocketDisconnect",
 ]

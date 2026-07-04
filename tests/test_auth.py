@@ -6,14 +6,18 @@ simplicity — a real project plugs in real JWT verification).
 
 Classes: none — pytest test functions only.
 
-Functions (5):
+Functions (8):
     - _make_app: builds a FastAPI app wired to a fake Auth setup, with
-      three routes exercising current_user/require_role/require.
+      three routes exercising current_user/require_role/require, plus a
+      websocket route exercising current_user_ws.
     - test_missing_token_is_401
     - test_unknown_user_is_401
     - test_wrong_role_is_403
     - test_correct_role_is_200
     - test_require_predicate_gate
+    - test_ws_missing_token_is_rejected
+    - test_ws_invalid_token_is_rejected
+    - test_ws_valid_token_is_accepted
 """
 import pytest
 from fastapi import FastAPI
@@ -74,6 +78,11 @@ def _client() -> TestClient:
     async def approved_only(user=mango.Depends(auth.require(lambda u: u.approved))):
         return {"id": user.id}
 
+    @app.websocket("/ws")
+    async def ws_route(websocket: mango.WebSocket, user=mango.Depends(auth.current_user_ws())):
+        await websocket.accept()
+        await websocket.send_json({"id": user.id})
+
     return TestClient(app)
 
 
@@ -109,3 +118,23 @@ def test_require_predicate_gate(_client: TestClient):
 
     allowed = _client.get("/approved-only", headers={"Authorization": "Bearer creator-token"})
     assert allowed.status_code == 200  # creator-token is approved
+
+
+def test_ws_missing_token_is_rejected(_client: TestClient):
+    """No ?token= query param at all -> the connection is rejected, not silently accepted."""
+    with pytest.raises(Exception):  # noqa: B017 — TestClient's websocket rejection exception type isn't part of mango's own contract
+        with _client.websocket_connect("/ws"):
+            pass
+
+
+def test_ws_invalid_token_is_rejected(_client: TestClient):
+    """A token that doesn't verify -> rejected, same as the HTTP-route case."""
+    with pytest.raises(Exception):  # noqa: B017
+        with _client.websocket_connect("/ws?token=nonsense"):
+            pass
+
+
+def test_ws_valid_token_is_accepted(_client: TestClient):
+    """A valid, known token -> accepted, and current_user_ws() resolved the right user."""
+    with _client.websocket_connect("/ws?token=creator-token") as websocket:
+        assert websocket.receive_json() == {"id": "creator-token"}

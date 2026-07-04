@@ -1,6 +1,6 @@
 [project]
 name = "mangoframe"
-version = "0.9.0"
+version = "0.10.0"
 description = "A thin convention-and-scaffolding layer over FastAPI + SQLAlchemy — collapses the model/repository/service/schema/router module shape into one declaration."
 readme = "README.md"
 license = "MIT"
