@@ -14,8 +14,8 @@ written once, not once per project.
 
 Classes (1):
     - Auth: holds a token verifier + user loader; exposes
-      get_claims/get_current_user/require_role/require as FastAPI
-      dependencies.
+      get_claims/get_current_user/require_role/require/current_user/
+      current_user_ws as FastAPI dependencies.
 
 Functions: none — all behavior lives on Auth's methods.
 """
@@ -28,7 +28,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from mango.exceptions import ForbiddenError, UnauthorizedError
-from mango.web import Depends
+from mango.web import Depends, WebSocket
 
 ClaimsVerifier = Callable[[str], dict]  # raw bearer token -> decoded claims dict; must raise on an invalid token
 UserLoader = Callable[[AsyncSession, dict], Awaitable[Any]]  # (session, claims) -> user row, or None if not found
@@ -151,5 +151,49 @@ class Auth:
         ) -> Any:
             claims = await self.get_claims(credentials)
             return await self.get_current_user(claims, session)
+
+        return _check
+
+    def current_user_ws(self, param_name: str = "token") -> Callable[..., Awaitable[Any]]:
+        """Websocket-route equivalent of `current_user()`. A browser
+        WebSocket connection can't set a custom `Authorization` header
+        during its handshake, so this reads the token from a query
+        parameter instead (`?token=...` by default) — the standard
+        alternative shape — while reusing this Auth instance's own
+        `verify_token`/`load_user` callables, so the two entry points
+        never drift out of sync.
+
+        On any failure (missing/invalid token, no matching user row)
+        this closes the websocket itself with a 4401 code and raises
+        `WebSocketDisconnect`, since raising a plain `mango.MangoError`
+        (as the HTTP-route dependencies do) has no equivalent handling
+        for a websocket connection — there's no HTTP response to shape,
+        only the connection to close.
+
+            @router.websocket("/ws/documents/{document_id}")
+            async def collab(
+                websocket: WebSocket,
+                user = Depends(auth.current_user_ws()),
+            ):
+                await websocket.accept()
+                ...
+        """
+        from mango.web import WebSocketDisconnect  # imported here, not at module top, to avoid a hard fastapi.WebSocket dependency for projects that never use this method
+
+        async def _check(websocket: WebSocket, session: AsyncSession = Depends(self._get_db)) -> Any:
+            token = websocket.query_params.get(param_name)
+            if token is None:
+                await websocket.close(code=4401, reason="missing token")
+                raise WebSocketDisconnect(code=4401)
+            try:
+                claims = self._verify_token(token)
+            except Exception as exc:
+                await websocket.close(code=4401, reason="invalid token")
+                raise WebSocketDisconnect(code=4401) from exc
+            user = await self._load_user(session, claims)
+            if user is None:
+                await websocket.close(code=4401, reason="no user record for this token")
+                raise WebSocketDisconnect(code=4401)
+            return user
 
         return _check
